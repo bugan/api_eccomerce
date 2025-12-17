@@ -1,8 +1,10 @@
 const orderRepository = require('./orderRepository');
 const cartService = require('../cart/cartService');
 const productRepository = require('../products/productRepository');
+const couponService = require('../coupons/couponService');
 const AppError = require('../../utils/AppError');
 const logger = require('../../config/logger');
+const redisClient = require('../../config/redis');
 
 const orderService = {
     listOrders: async (userId) => {
@@ -17,7 +19,7 @@ const orderService = {
         }
 
         // 2. Recalcular Preços e Validar (Snapshot)
-        let totalValue = 0;
+        let subtotal = 0;
         const validItems = [];
 
         for (const item of cart.items) {
@@ -37,27 +39,48 @@ const orderService = {
                 quantity: item.quantity,
                 price: Number(product.price)
             });
-            totalValue += Number(product.price) * item.quantity;
+            subtotal += Number(product.price) * item.quantity;
         }
 
-        // 3. Executar Transação no Banco
+        // 3. Processar Desconto (Cupom)
+        let discount = 0;
+        let couponId = null;
+
+        if (cart.couponCode) {
+            try {
+                const { coupon, discountValue } = await couponService.validateCoupon(cart.couponCode, subtotal);
+                discount = discountValue;
+                couponId = coupon.id;
+            } catch (error) {
+                // Cupom expirou ou regras mudaram no checkout
+                throw new AppError(`Erro no cupom: ${error.message}`, 400, 'INVALID_PAYLOAD');
+            }
+        }
+
+        let totalValue = subtotal - discount;
+        if (totalValue < 0) totalValue = 0;
+
+        // 4. Executar Transação no Banco
         let order;
         try {
-            order = await orderRepository.createOrderTransaction(userId, validItems, totalValue);
+            order = await orderRepository.createOrderTransaction(
+                userId,
+                validItems,
+                totalValue,
+                subtotal,
+                discount,
+                couponId
+            );
         } catch (error) {
             logger.error(`Checkout falhou: ${error.message}`);
-            throw new AppError('Erro ao processar pedido ou estoque', 500, 'INTERNAL_SERVER_ERROR');
+            // Melhorar mensagem de erro pro user
+            throw new AppError(error.message || 'Erro ao processar pedido', 500, 'INTERNAL_SERVER_ERROR');
         }
 
-        // 4. Limpar Carrinho
-        // Como o redis remove item a item, seria bom ter um clearCart.
-        // Vou simular um clear setando vazio ou iterando.
-        // O ideal é implementar clear no cartService.
-        // Por hora, vou expirar a chave ou deletar.
-        const redisClient = require('../../config/redis');
+        // 5. Limpar Carrinho
         await redisClient.del(`cart:default:${userId}`);
 
-        // 5. Emitir Evento (Simulado)
+        // 6. Emitir Evento
         logger.info(`Evento Emitido: order.created { orderId: ${order.id} }`);
 
         return order;
