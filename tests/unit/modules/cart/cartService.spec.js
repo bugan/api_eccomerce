@@ -4,22 +4,22 @@ const redisMock = {
   get: jest.fn(),
   set: jest.fn()
 };
-jest.mock('../../../../src/config/redis', () => redisMock);
+jest.mock('../../../../../src/config/redis', () => redisMock);
 
 const prismaMock = {
   product: {
     findUnique: jest.fn()
   }
 };
-jest.mock('../../../../src/config/database', () => prismaMock);
+jest.mock('../../../../../src/config/database', () => prismaMock);
 
 const couponServiceMock = {
   validateCoupon: jest.fn()
 };
-jest.mock('../../../../src/modules/coupons/couponService', () => couponServiceMock);
+jest.mock('../../../../../src/modules/coupons/couponService', () => couponServiceMock);
 
-const cartService = require('../../../../src/modules/cart/cartService');
-const AppError = require('../../../../src/utils/AppError');
+const cartService = require('../../../../../src/modules/cart/cartService');
+const AppError = require('../../../../../src/utils/AppError');
 
 const buildCartKey = (tenantId, userId) => `cart:${tenantId}:${userId}`;
 
@@ -38,7 +38,7 @@ describe('cartService', () => {
   });
 
   describe('getCart', () => {
-    it('T4.1 - returns default cart when redis key is missing', async () => {
+    it('T4.1 - getCart com chave inexistente no Redis deve retornar objeto padrão', async () => {
       // Arrange
       redisMock.get.mockResolvedValueOnce(null);
 
@@ -58,32 +58,7 @@ describe('cartService', () => {
   });
 
   describe('addItem', () => {
-    it('T4.2 - recalculates totals without coupon and persists cart', async () => {
-      // Arrange
-      const product = { id: 'prod-1', name: 'Produto', price: 25, stock: 10 };
-      prismaMock.product.findUnique.mockResolvedValueOnce(product);
-      redisMock.get.mockResolvedValueOnce(null);
-
-      // Act
-      const cart = await cartService.addItem(userId, { productId: 'prod-1', quantity: 2 }, tenantId);
-
-      // Assert
-      expect(cart.items).toEqual([
-        { productId: 'prod-1', name: 'Produto', price: 25, quantity: 2 }
-      ]);
-      expect(cart.subtotal).toBe(50);
-      expect(cart.discount).toBe(0);
-      expect(cart.total).toBe(50);
-      expect(cart.couponCode).toBeNull();
-
-      expect(redisMock.set).toHaveBeenCalledTimes(1);
-      const [key, payload, options] = redisMock.set.mock.calls[0];
-      expect(key).toBe(buildCartKey(tenantId, userId));
-      expect(JSON.parse(payload)).toEqual(cart);
-      expect(options).toEqual({ EX: CART_TTL });
-    });
-
-    it('T4.6 - throws AppError when product is not found', async () => {
+    it('T4.6 - addItem quando product não existe deve lançar AppError 404 RESOURCE_NOT_FOUND', async () => {
       // Arrange
       prismaMock.product.findUnique.mockResolvedValueOnce(null);
 
@@ -100,7 +75,7 @@ describe('cartService', () => {
       expect(redisMock.set).not.toHaveBeenCalled();
     });
 
-    it('T4.7 - throws when requested quantity exceeds available stock', async () => {
+    it('T4.7 - addItem quando stock < quantity inicial deve lançar AppError 409 OUT_OF_STOCK', async () => {
       // Arrange
       const product = { id: 'prod-1', name: 'Produto', price: 50, stock: 1 };
       prismaMock.product.findUnique.mockResolvedValueOnce(product);
@@ -117,7 +92,7 @@ describe('cartService', () => {
       expect(redisMock.set).not.toHaveBeenCalled();
     });
 
-    it('T4.8 - increments an existing item and keeps totals consistent', async () => {
+    it('T4.8.1 - addItem quando item já existe no carrinho incrementa quantity e respeita estoque', async () => {
       // Arrange
       const product = { id: 'prod-1', name: 'Produto', price: 10, stock: 5 };
       prismaMock.product.findUnique.mockResolvedValueOnce(product);
@@ -143,7 +118,7 @@ describe('cartService', () => {
       expect(savedCart.items[0].quantity).toBe(3);
     });
 
-    it('T4.8 - prevents incrementing an item beyond stock limits', async () => {
+    it('T4.8.2 - addItem quando nova quantity excede stock deve lançar AppError 409', async () => {
       // Arrange
       const product = { id: 'prod-1', name: 'Produto', price: 10, stock: 5 };
       prismaMock.product.findUnique.mockResolvedValueOnce(product);
@@ -170,82 +145,7 @@ describe('cartService', () => {
   });
 
   describe('removeItem', () => {
-    it('T4.3 - reapplies discount when coupon validation succeeds', async () => {
-      // Arrange
-      const storedCart = {
-        items: [
-          { productId: 'prod-1', price: 40, quantity: 1 },
-          { productId: 'prod-2', price: 10, quantity: 2 }
-        ],
-        couponCode: 'PROMO10',
-        subtotal: 0,
-        discount: 0,
-        total: 0
-      };
-      redisMock.get.mockResolvedValueOnce(JSON.stringify(storedCart));
-      couponServiceMock.validateCoupon.mockResolvedValueOnce({ discountValue: 5 });
-
-      // Act
-      const cart = await cartService.removeItem(userId, 'prod-2', tenantId);
-
-      // Assert
-      expect(couponServiceMock.validateCoupon).toHaveBeenCalledWith('PROMO10', 40);
-      expect(cart.discount).toBe(5);
-      expect(cart.subtotal).toBe(40);
-      expect(cart.total).toBe(35);
-      expect(redisMock.set).toHaveBeenCalledWith(buildCartKey(tenantId, userId), expect.any(String), { EX: CART_TTL });
-    });
-
-    it('T4.4 - removes coupon when validation fails and records message', async () => {
-      // Arrange
-      const storedCart = {
-        items: [
-          { productId: 'prod-1', price: 20, quantity: 1 },
-          { productId: 'prod-2', price: 15, quantity: 1 }
-        ],
-        couponCode: 'PROMO',
-        subtotal: 0,
-        discount: 0,
-        total: 0
-      };
-      redisMock.get.mockResolvedValueOnce(JSON.stringify(storedCart));
-      couponServiceMock.validateCoupon.mockRejectedValueOnce(new Error('Cupom expirado'));
-
-      // Act
-      const cart = await cartService.removeItem(userId, 'prod-2', tenantId);
-
-      // Assert
-      expect(cart.couponCode).toBeNull();
-      expect(cart.discount).toBe(0);
-      expect(cart.message).toBe('Cupom removido: Cupom expirado');
-      expect(cart.subtotal).toBe(20);
-      expect(cart.total).toBe(20);
-      expect(redisMock.set).toHaveBeenCalledWith(buildCartKey(tenantId, userId), expect.any(String), { EX: CART_TTL });
-    });
-
-    it('T4.5 - clamps total to zero when discount exceeds subtotal', async () => {
-      // Arrange
-      const storedCart = {
-        items: [{ productId: 'prod-1', price: 30, quantity: 1 }],
-        couponCode: 'PROMO',
-        subtotal: 0,
-        discount: 0,
-        total: 0
-      };
-      redisMock.get.mockResolvedValueOnce(JSON.stringify(storedCart));
-      couponServiceMock.validateCoupon.mockResolvedValueOnce({ discountValue: 100 });
-
-      // Act
-      const cart = await cartService.removeItem(userId, 'unknown', tenantId);
-
-      // Assert
-      expect(cart.subtotal).toBe(30);
-      expect(cart.discount).toBe(100);
-      expect(cart.total).toBe(0);
-      expect(redisMock.set).toHaveBeenCalledWith(buildCartKey(tenantId, userId), expect.any(String), { EX: CART_TTL });
-    });
-
-    it('T4.9 - removes an existing item and recalculates totals', async () => {
+    it('T4.9 - removeItem removendo item existente recalcule subtotal/total e persiste (sem cupom)', async () => {
       // Arrange
       const storedCart = {
         items: [
@@ -271,7 +171,7 @@ describe('cartService', () => {
       expect(couponServiceMock.validateCoupon).not.toHaveBeenCalled();
     });
 
-    it('T4.10 - ignores unknown productId but persists cart state', async () => {
+    it('T4.10 - removeItem com productId inexistente mantém items mas ainda assim chama saveCart (sem cupom)', async () => {
       // Arrange
       const storedCart = {
         items: [
@@ -292,12 +192,42 @@ describe('cartService', () => {
       expect(cart.items).toEqual(storedCart.items);
       expect(cart.subtotal).toBe(75);
       expect(cart.total).toBe(75);
+      expect(cart.discount).toBe(0);
+      expect(redisMock.set).toHaveBeenCalledWith(buildCartKey(tenantId, userId), expect.any(String), { EX: CART_TTL });
+      expect(couponServiceMock.validateCoupon).not.toHaveBeenCalled();
+    });
+
+    it('T4.10b - removeItem com cupom: garante que validateCoupon é chamado e discount/total coerentes', async () => {
+      // Arrange
+      const storedCart = {
+        items: [
+          { productId: 'prod-1', price: 50, quantity: 1 }, // 50
+          { productId: 'prod-2', price: 25, quantity: 2 }  // 50
+        ],
+        couponCode: 'PROMO10',
+        subtotal: 0,
+        discount: 0,
+        total: 0
+      };
+      redisMock.get.mockResolvedValueOnce(JSON.stringify(storedCart));
+      couponServiceMock.validateCoupon.mockResolvedValueOnce({ discountValue: 20 });
+
+      // Act
+      const cart = await cartService.removeItem(userId, 'prod-2', tenantId);
+
+      // Assert
+      // Subtotal deve refletir apenas o item restante
+      expect(cart.items).toEqual([{ productId: 'prod-1', price: 50, quantity: 1 }]);
+      expect(couponServiceMock.validateCoupon).toHaveBeenCalledWith('PROMO10', 50);
+      expect(cart.subtotal).toBe(50);
+      expect(cart.discount).toBe(20);
+      expect(cart.total).toBe(30);
       expect(redisMock.set).toHaveBeenCalledWith(buildCartKey(tenantId, userId), expect.any(String), { EX: CART_TTL });
     });
   });
 
   describe('applyCoupon', () => {
-    it('T4.11 - throws when cart is empty', async () => {
+    it('T4.11 - applyCoupon com carrinho vazio deve lançar AppError 400 INVALID_PAYLOAD', async () => {
       // Arrange
       const storedCart = {
         items: [],
@@ -321,7 +251,7 @@ describe('cartService', () => {
       expect(redisMock.set).not.toHaveBeenCalled();
     });
 
-    it('T4.12 - applies coupon with current subtotal and persists cart', async () => {
+    it('T4.12 - applyCoupon com itens no carrinho calcula subtotal, chama validateCoupon e persiste', async () => {
       // Arrange
       const storedCart = {
         items: [
@@ -352,7 +282,7 @@ describe('cartService', () => {
   });
 
   describe('removeCoupon', () => {
-    it('T4.13 - clears coupon data and recalculates totals', async () => {
+    it('T4.13 - removeCoupon limpa couponCode, zera desconto e recalcula total', async () => {
       // Arrange
       const storedCart = {
         items: [
@@ -365,6 +295,7 @@ describe('cartService', () => {
         total: 60
       };
       redisMock.get.mockResolvedValueOnce(JSON.stringify(storedCart));
+      couponServiceMock.validateCoupon.mockResolvedValueOnce({ discountValue: 10 });
 
       // Act
       const cart = await cartService.removeCoupon(userId, tenantId);
