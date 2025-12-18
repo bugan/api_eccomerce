@@ -55,6 +55,25 @@ describe('cartService', () => {
         couponCode: null
       });
     });
+
+    it('T4.1.1 - getCart com valor existente no Redis deve fazer JSON.parse e retornar o objeto armazenado', async () => {
+      // Arrange
+      const storedCart = {
+        items: [{ productId: 'p1', price: 10, quantity: 1 }],
+        subtotal: 10,
+        discount: 2,
+        total: 8,
+        couponCode: 'PROMO'
+      };
+      redisMock.get.mockResolvedValueOnce(JSON.stringify(storedCart));
+
+      // Act
+      const cart = await cartService.getCart(userId, tenantId);
+
+      // Assert
+      expect(redisMock.get).toHaveBeenCalledWith(buildCartKey(tenantId, userId));
+      expect(cart).toEqual(storedCart);
+    });
   });
 
   describe('addItem', () => {
@@ -145,7 +164,7 @@ describe('cartService', () => {
   });
 
   describe('removeItem', () => {
-    it('T4.9 - removeItem removendo item existente recalcule subtotal/total e persiste (sem cupom)', async () => {
+    it('T4.9 - removeItem removendo item existente recalcule subtotal/total e persiste', async () => {
       // Arrange
       const storedCart = {
         items: [
@@ -171,7 +190,7 @@ describe('cartService', () => {
       expect(couponServiceMock.validateCoupon).not.toHaveBeenCalled();
     });
 
-    it('T4.10 - removeItem com productId inexistente mantém items mas ainda assim chama saveCart (sem cupom)', async () => {
+    it('T4.10 - removeItem com productId inexistente mantém items mas ainda assim chama saveCart', async () => {
       // Arrange
       const storedCart = {
         items: [
@@ -192,36 +211,6 @@ describe('cartService', () => {
       expect(cart.items).toEqual(storedCart.items);
       expect(cart.subtotal).toBe(75);
       expect(cart.total).toBe(75);
-      expect(cart.discount).toBe(0);
-      expect(redisMock.set).toHaveBeenCalledWith(buildCartKey(tenantId, userId), expect.any(String), { EX: CART_TTL });
-      expect(couponServiceMock.validateCoupon).not.toHaveBeenCalled();
-    });
-
-    it('T4.10b - removeItem com cupom: garante que validateCoupon é chamado e discount/total coerentes', async () => {
-      // Arrange
-      const storedCart = {
-        items: [
-          { productId: 'prod-1', price: 50, quantity: 1 }, // 50
-          { productId: 'prod-2', price: 25, quantity: 2 }  // 50
-        ],
-        couponCode: 'PROMO10',
-        subtotal: 0,
-        discount: 0,
-        total: 0
-      };
-      redisMock.get.mockResolvedValueOnce(JSON.stringify(storedCart));
-      couponServiceMock.validateCoupon.mockResolvedValueOnce({ discountValue: 20 });
-
-      // Act
-      const cart = await cartService.removeItem(userId, 'prod-2', tenantId);
-
-      // Assert
-      // Subtotal deve refletir apenas o item restante
-      expect(cart.items).toEqual([{ productId: 'prod-1', price: 50, quantity: 1 }]);
-      expect(couponServiceMock.validateCoupon).toHaveBeenCalledWith('PROMO10', 50);
-      expect(cart.subtotal).toBe(50);
-      expect(cart.discount).toBe(20);
-      expect(cart.total).toBe(30);
       expect(redisMock.set).toHaveBeenCalledWith(buildCartKey(tenantId, userId), expect.any(String), { EX: CART_TTL });
     });
   });
@@ -307,6 +296,111 @@ describe('cartService', () => {
       expect(cart.total).toBe(70);
       expect(couponServiceMock.validateCoupon).not.toHaveBeenCalled();
       expect(redisMock.set).toHaveBeenCalledWith(buildCartKey(tenantId, userId), expect.any(String), { EX: CART_TTL });
+    });
+  });
+
+  describe('saveCart (via efeitos observáveis)', () => {
+    it('T4.2 - saveCart sem couponCode recalcula subtotal/total e chama Redis.set com TTL', async () => {
+      // Arrange
+      const key = buildCartKey(tenantId, userId);
+      const cart = {
+        items: [
+          { productId: 'prod-1', price: 40, quantity: 1 },
+          { productId: 'prod-2', price: 10, quantity: 2 }
+        ],
+        couponCode: null,
+        subtotal: 0,
+        discount: 0,
+        total: 0
+      };
+      redisMock.get.mockResolvedValueOnce(JSON.stringify(cart));
+
+      // Act
+      const result = await cartService.removeItem(userId, 'prod-x', tenantId);
+
+      // Assert
+      expect(result.subtotal).toBe(60);
+      expect(result.discount).toBe(0);
+      expect(result.total).toBe(60);
+      expect(redisMock.set).toHaveBeenCalledWith(key, expect.any(String), { EX: CART_TTL });
+    });
+
+    it('T4.3 - saveCart com couponCode válido atualiza discount e total', async () => {
+      // Arrange
+      const key = buildCartKey(tenantId, userId);
+      const cart = {
+        items: [
+          { productId: 'prod-1', price: 20, quantity: 1 },
+          { productId: 'prod-2', price: 15, quantity: 1 }
+        ],
+        couponCode: 'PROMO',
+        subtotal: 0,
+        discount: 0,
+        total: 0
+      };
+      redisMock.get.mockResolvedValueOnce(JSON.stringify(cart));
+      couponServiceMock.validateCoupon.mockResolvedValueOnce({ discountValue: 5 });
+
+      // Act
+      const result = await cartService.removeItem(userId, 'none', tenantId);
+
+      // Assert
+      expect(couponServiceMock.validateCoupon).toHaveBeenCalledWith('PROMO', 35);
+      expect(result.subtotal).toBe(35);
+      expect(result.discount).toBe(5);
+      expect(result.total).toBe(30);
+      expect(redisMock.set).toHaveBeenCalledWith(key, expect.any(String), { EX: CART_TTL });
+    });
+
+    it('T4.4 - saveCart com couponCode inválido remove cupom, zera desconto e adiciona mensagem', async () => {
+      // Arrange
+      const key = buildCartKey(tenantId, userId);
+      const cart = {
+        items: [
+          { productId: 'prod-1', price: 20, quantity: 1 },
+          { productId: 'prod-2', price: 15, quantity: 1 }
+        ],
+        couponCode: 'PROMO',
+        subtotal: 0,
+        discount: 0,
+        total: 0
+      };
+      redisMock.get.mockResolvedValueOnce(JSON.stringify(cart));
+      couponServiceMock.validateCoupon.mockRejectedValueOnce(new Error('Cupom inválido'));
+
+      // Act
+      const result = await cartService.removeItem(userId, 'none', tenantId);
+
+      // Assert
+      expect(result.couponCode).toBeNull();
+      expect(result.discount).toBe(0);
+      expect(result.message).toBe('Cupom removido: Cupom inválido');
+      expect(result.subtotal).toBe(35);
+      expect(result.total).toBe(35);
+      expect(redisMock.set).toHaveBeenCalledWith(key, expect.any(String), { EX: CART_TTL });
+    });
+
+    it('T4.5 - saveCart garante que total nunca fica negativo', async () => {
+      // Arrange
+      const key = buildCartKey(tenantId, userId);
+      const cart = {
+        items: [{ productId: 'prod-1', price: 30, quantity: 1 }],
+        couponCode: 'PROMO',
+        subtotal: 0,
+        discount: 0,
+        total: 0
+      };
+      redisMock.get.mockResolvedValueOnce(JSON.stringify(cart));
+      couponServiceMock.validateCoupon.mockResolvedValueOnce({ discountValue: 100 });
+
+      // Act
+      const result = await cartService.removeItem(userId, 'unknown', tenantId);
+
+      // Assert
+      expect(result.subtotal).toBe(30);
+      expect(result.discount).toBe(100);
+      expect(result.total).toBe(0);
+      expect(redisMock.set).toHaveBeenCalledWith(key, expect.any(String), { EX: CART_TTL });
     });
   });
 });
